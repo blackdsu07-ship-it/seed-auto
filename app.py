@@ -26,7 +26,7 @@ import streamlit as st
 
 IMAP_HOST = "imap.mail.yahoo.com"
 IMAP_PORT = 993
-SPAM_FOLDER_CANDIDATES = ["Bulk", "Spam", "Junk"]
+SPAM_FOLDER_CANDIDATES = ["Bulk", "Bulk Mail", "Spam", "Junk"]
 LOOKBACK_SECONDS = 24 * 60 * 60
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -71,16 +71,20 @@ def parse_accounts_file(uploaded_file):
     return accounts
 
 
-def open_mailbox(email_addr, password, folder="INBOX"):
+def open_mailbox(email_addr, password, folder="INBOX", debug=None):
     try:
         imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
         imap.login(email_addr, password)
-        typ, _ = imap.select(folder, readonly=True)
+        typ, sel_data = imap.select(folder, readonly=True)
         if typ != "OK":
+            if debug is not None:
+                debug["select_error"] = f"SELECT {folder} -> {typ} {sel_data}"
             imap.logout()
             return None
         return imap
-    except Exception:
+    except Exception as e:
+        if debug is not None:
+            debug["login_error"] = f"{type(e).__name__}: {e}"
         return None
 
 
@@ -104,38 +108,75 @@ def find_spam_folder(email_addr, password):
         return None
 
 
-def search_recent_from(imap, sender, lookback_seconds):
+def search_recent_from(imap, sender, lookback_seconds, debug=None):
+    """debug, if passed a dict, gets populated with diagnostics so the
+    caller can show *why* zero matches came back instead of just seeing 0."""
     since_date = (datetime.now() - timedelta(days=2)).strftime("%d-%b-%Y")
+    criteria = f'(SINCE "{since_date}" FROM "{sender}")'
+    if debug is not None:
+        debug["criteria"] = criteria
+
     try:
-        typ, data = imap.uid("search", None, f'(SINCE "{since_date}" FROM "{sender}")')
-    except Exception:
+        typ, data = imap.uid("search", None, criteria)
+    except Exception as e:
+        if debug is not None:
+            debug["search_error"] = f"{type(e).__name__}: {e}"
         return []
+
+    if debug is not None:
+        debug["search_typ"] = typ
+        debug["search_raw"] = data
+
     if typ != "OK" or not data or not data[0]:
+        if debug is not None:
+            debug["raw_uid_count"] = 0
         return []
+
+    uids = data[0].split()
+    if debug is not None:
+        debug["raw_uid_count"] = len(uids)
+        debug["dropped_no_date_header"] = 0
+        debug["dropped_date_parse_error"] = 0
+        debug["dropped_older_than_cutoff"] = 0
+        debug["fetch_errors"] = []
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
     matches = []
-    for uid in data[0].split():
+    for uid in uids:
         try:
             typ, hdr_data = imap.uid(
                 "fetch", uid, "(BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM)])"
             )
             if typ != "OK" or not hdr_data or not hdr_data[0]:
+                if debug is not None:
+                    debug["fetch_errors"].append(f"uid {uid}: fetch typ={typ}")
                 continue
             raw_header = hdr_data[0][1]
             msg = email.message_from_bytes(raw_header)
             date_hdr = msg.get("Date")
             if not date_hdr:
+                if debug is not None:
+                    debug["dropped_no_date_header"] += 1
                 continue
-            dt = email.utils.parsedate_to_datetime(date_hdr)
+            try:
+                dt = email.utils.parsedate_to_datetime(date_hdr)
+            except Exception as e:
+                if debug is not None:
+                    debug["dropped_date_parse_error"] += 1
+                    debug["fetch_errors"].append(f"uid {uid}: bad Date header {date_hdr!r} ({e})")
+                continue
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             if dt < cutoff:
+                if debug is not None:
+                    debug["dropped_older_than_cutoff"] += 1
                 continue
             subject = msg.get("Subject", "(no subject)")
             from_ = msg.get("From", "")
             matches.append({"uid": uid, "subject": subject, "from": from_, "date": dt})
-        except Exception:
+        except Exception as e:
+            if debug is not None:
+                debug["fetch_errors"].append(f"uid {uid}: {type(e).__name__}: {e}")
             continue
     return matches
 
@@ -215,6 +256,7 @@ ensure_playwright_browser()
 
 accounts_file = st.file_uploader("Accounts file (CSV/TXT — one \"email,password\" per line)", type=["csv", "txt"])
 sender = st.text_input("Sender address or domain to track", placeholder="yourdomain.com")
+debug_mode = st.checkbox("Show debug info (raw IMAP search counts / drop reasons)", value=False)
 run = st.button("Run Check", type="primary")
 
 if run:
@@ -234,15 +276,18 @@ if run:
             progress = st.progress(0.0, text="Starting...")
             for i, (acc_email, acc_pass) in enumerate(accounts):
                 progress.progress((i) / len(accounts), text=f"Checking {acc_email}...")
-                account_result = {"email": acc_email, "status": "ok", "messages": []}
+                account_result = {"email": acc_email, "status": "ok", "messages": [], "debug": {}}
 
-                inbox_conn = open_mailbox(acc_email, acc_pass, "INBOX")
+                inbox_debug = {}
+                inbox_conn = open_mailbox(acc_email, acc_pass, "INBOX", debug=inbox_debug)
+                account_result["debug"]["inbox"] = inbox_debug
                 if not inbox_conn:
                     account_result["status"] = "auth_failed"
                     results.append(account_result)
                     continue
 
-                for m in search_recent_from(inbox_conn, sender, LOOKBACK_SECONDS):
+                inbox_search_debug = {}
+                for m in search_recent_from(inbox_conn, sender, LOOKBACK_SECONDS, debug=inbox_search_debug):
                     body = get_message_body(inbox_conn, m["uid"])
                     links = extract_links(body)
                     clicks = [{"url": link, "method": click_link(link)} for link in links]
@@ -256,16 +301,21 @@ if run:
                         }
                     )
                     total_inbox += 1
+                account_result["debug"]["inbox_search"] = inbox_search_debug
                 try:
                     inbox_conn.logout()
                 except Exception:
                     pass
 
                 spam_folder = find_spam_folder(acc_email, acc_pass)
+                account_result["debug"]["spam_folder_found"] = spam_folder
                 if spam_folder:
-                    spam_conn = open_mailbox(acc_email, acc_pass, spam_folder)
+                    spam_debug = {}
+                    spam_conn = open_mailbox(acc_email, acc_pass, spam_folder, debug=spam_debug)
+                    account_result["debug"]["spam"] = spam_debug
                     if spam_conn:
-                        for m in search_recent_from(spam_conn, sender, LOOKBACK_SECONDS):
+                        spam_search_debug = {}
+                        for m in search_recent_from(spam_conn, sender, LOOKBACK_SECONDS, debug=spam_search_debug):
                             body = get_message_body(spam_conn, m["uid"])
                             links = extract_links(body)
                             clicks = [{"url": link, "method": click_link(link)} for link in links]
@@ -279,6 +329,7 @@ if run:
                                 }
                             )
                             total_spam += 1
+                        account_result["debug"]["spam_search"] = spam_search_debug
                         try:
                             spam_conn.logout()
                         except Exception:
@@ -304,6 +355,8 @@ if run:
                 match_count = len(acct["messages"])
                 header_status = acct["status"] if acct["status"] != "ok" else f"{match_count} match(es)"
                 with st.expander(f"{acct['email']} — {header_status}"):
+                    if debug_mode:
+                        st.json(acct.get("debug", {}))
                     if acct["status"] != "ok":
                         st.error(acct["status"])
                         continue
