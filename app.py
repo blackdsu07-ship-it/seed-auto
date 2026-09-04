@@ -33,6 +33,12 @@ from datetime import datetime
 import requests
 import streamlit as st
 
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 IMAP_HOST = "imap.mail.yahoo.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT = 20  # seconds - socket-level timeout so a stuck connection can't hang forever
@@ -259,30 +265,28 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
     Spam/Bulk) and clicks the links inside each using one real headless
     browser session for the whole run (much faster than a new browser per
     link, and it's the actual browser navigating, not just an HTTP request).
-    Falls back to a plain request only if the browser navigation itself
-    fails. Runs only when the user presses the button for this account.
+    Falls back to a plain request if the browser navigation itself fails,
+    or if Playwright isn't installed in this deployment at all. Runs only
+    when the user presses the button for this account.
 
     on_progress(opened, total_messages, clicked), if given, is called after
     every message is opened and after every link click so the caller can
     show live counts.
     """
-    ensure_playwright_browser()
     messages = []
     total_msgs = len(inbox_uids) + len(spam_uids)
     counts = {"opened": 0, "clicked": 0}
 
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-        page = browser.new_page(user_agent=USER_AGENT)
-
+    def run(page):
         def click_one(url):
-            try:
-                page.goto(url, wait_until="networkidle", timeout=25000)
-                page.wait_for_timeout(1500)
-                method = "browser"
-            except Exception:
+            if page is not None:
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=25000)
+                    page.wait_for_timeout(1500)
+                    method = "browser"
+                except Exception:
+                    method = "http" if click_via_requests(url) else "failed"
+            else:
                 method = "http" if click_via_requests(url) else "failed"
             counts["clicked"] += 1
             if on_progress:
@@ -319,8 +323,22 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
                 except Exception:
                     pass
 
-        page.close()
-        browser.close()
+    if PLAYWRIGHT_AVAILABLE:
+        ensure_playwright_browser()
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+                page = browser.new_page(user_agent=USER_AGENT)
+                run(page)
+                page.close()
+                browser.close()
+        except Exception:
+            # Browser binary missing/failed to launch even though the package
+            # imported fine - fall back to requests-only for this run rather
+            # than losing all progress made so far.
+            run(None)
+    else:
+        run(None)
 
     return messages
 
@@ -331,6 +349,15 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
 
 st.title("Seed Unread Count Checker")
 st.caption("Yahoo IMAP · unread-from-sender count in Inbox + Spam/Bulk per account")
+
+if not PLAYWRIGHT_AVAILABLE:
+    st.warning(
+        "⚠️ Playwright isn't installed in this deployment - \"Open email & click links\" "
+        "will fall back to plain HTTP requests instead of a real browser. To fix: make sure "
+        "requirements.txt in your repo has `streamlit`, `requests`, and `playwright` on separate "
+        "lines, then use Manage app → Reboot app (a plain redeploy can reuse a cached environment "
+        "and skip picking up the new package)."
+    )
 
 accounts_file = st.file_uploader("Accounts file (CSV/TXT — one \"email,password\" per line)", type=["csv", "txt"])
 sender = st.text_input("Sender address or domain to track", placeholder="yourdomain.com")
