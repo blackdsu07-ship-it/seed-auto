@@ -12,8 +12,8 @@ never the message bodies, no link-clicking.
 
 Per account, once you see a nonzero count, an "Open email & click links"
 button fetches the actual matched message(s) for that account, extracts
-links from the body, and clicks them with a real headless browser
-(Playwright) - only for that one account, only on demand.
+links from the body, and clicks them with a real, VISIBLE Chromium window
+(Playwright, headless=False) - only for that one account, only on demand.
 
 Optional: give a "Link to match" value. When set, only the first link in
 each message that CONTAINS that value (substring match, not exact) is
@@ -22,9 +22,13 @@ matched link is clicked, that message is marked as read (\\Seen) on the
 server. If no target is given, the old behavior applies: every link gets
 clicked and messages aren't marked read.
 
-Deploy on Streamlit Community Cloud:
-  - requirements.txt -> streamlit, requests, playwright
-  - packages.txt     -> apt deps Chromium needs (included alongside this file)
+Run this on your own PC (not Streamlit Community Cloud or any other
+headless server) if you want to actually see the browser: a visible
+browser window needs a real display, which a cloud server doesn't have.
+Locally:
+  pip install streamlit requests playwright
+  playwright install chromium
+  streamlit run seed_unread_checker.py
   - Yahoo accounts need an APP PASSWORD (Account Security > Generate app
     password), not the normal login password.
 """
@@ -298,12 +302,13 @@ def click_via_requests(url):
 def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spam_uids,
                                 target_link=None, on_progress=None):
     """Fetches only the specific matched messages for this account (Inbox +
-    Spam/Bulk) and clicks the links inside each using one real headless
-    browser session for the whole run (much faster than a new browser per
-    link, and it's the actual browser navigating, not just an HTTP request).
-    Falls back to a plain request only if the browser navigation itself
-    fails, or if Playwright isn't installed in this deployment at all.
-    Runs only when the user presses the button for this account.
+    Spam/Bulk) and clicks the links inside each using one real, VISIBLE
+    Chromium window (headless=False) for the whole run - not headless, so
+    this needs a display and only works when run on your own PC, not on a
+    headless server like Streamlit Community Cloud. Falls back to a plain
+    request only if the browser navigation itself fails, or if Playwright
+    isn't installed at all. Runs only when the user presses the button for
+    this account.
 
     If `target_link` is given, only the first link in each message that
     contains that value (substring match) is clicked, and the message is
@@ -386,8 +391,8 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
         ensure_playwright_browser()
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-                page = browser.new_page(user_agent=USER_AGENT)
+                browser = p.chromium.launch(headless=False, args=["--start-maximized"])
+                page = browser.new_page(user_agent=USER_AGENT, no_viewport=True)
                 run(page)
                 page.close()
                 browser.close()
