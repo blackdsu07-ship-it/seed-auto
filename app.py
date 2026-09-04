@@ -1,56 +1,37 @@
 """
-Seed Inbox Placement Checker (Yahoo IMAP) — Streamlit version
+Seed Unread Count Checker (Yahoo IMAP) — Streamlit version
 ---------------------------------------------------------------
 Upload accounts (email,password per line), give a sender address/domain to
-track. The app logs into each Yahoo IMAP account, finds matching emails from
-the last 24h in both Inbox and Spam/Bulk, opens them, clicks the links inside
-(requests first, headless Chromium via Playwright as fallback), and reports
-Inbox vs Spam placement + percentages.
+track. For each account, reports how many UNREAD messages from that sender
+are sitting in Inbox and in Spam/Bulk right now.
+
+No link-clicking, no full-header archival - just counts, and fast:
+IMAP SEARCH UNSEEN is a single lightweight server-side operation, and we
+only fetch the From header for the (usually small) set of unread messages
+to match the sender - never the whole mailbox.
 
 Deploy on Streamlit Community Cloud:
-  - requirements.txt -> streamlit, requests, playwright
-  - packages.txt     -> apt deps Chromium needs (included alongside this file)
+  - requirements.txt -> streamlit
   - Yahoo accounts need an APP PASSWORD (Account Security > Generate app
     password), not the normal login password.
 """
 
 import email
-import email.utils
 import imaplib
 import re
-import subprocess
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-import requests
 import streamlit as st
 
 IMAP_HOST = "imap.mail.yahoo.com"
 IMAP_PORT = 993
-IMAP_TIMEOUT = 20  # seconds - without this a stuck connection hangs forever
-MAX_CANDIDATES_PER_FOLDER = 400  # cap header fetches on high-volume shared seed mailboxes
-FOLDER_TIME_BUDGET = 60  # seconds - abort a folder's header-fetch loop past this, don't hang the whole run
+IMAP_TIMEOUT = 20  # seconds - socket-level timeout so a stuck connection can't hang forever
+MAX_CANDIDATES_PER_FOLDER = 400  # cap header fetches if a folder has huge unread volume
+FOLDER_TIME_BUDGET = 60  # seconds - abort a folder's fetch loop past this, move on
 SPAM_FOLDER_CANDIDATES = ["Bulk", "Bulk Mail", "Spam", "Junk"]
-LOOKBACK_SECONDS = 24 * 60 * 60
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
 
-st.set_page_config(page_title="Seed Inbox Placement Checker", layout="wide")
-
-
-# ---------------------------------------------------------------------------
-# Playwright setup (installs the headless browser once per running instance)
-# ---------------------------------------------------------------------------
-
-@st.cache_resource
-def ensure_playwright_browser():
-    try:
-        subprocess.run(["playwright", "install", "chromium"], check=False, timeout=180)
-    except Exception:
-        pass
-    return True
+st.set_page_config(page_title="Seed Unread Count Checker", layout="wide")
 
 
 # ---------------------------------------------------------------------------
@@ -112,70 +93,48 @@ def find_spam_folder(email_addr, password):
         return None
 
 
-def search_recent_from(imap, sender, lookback_seconds, debug=None):
-    """debug, if passed a dict, gets populated with diagnostics so the
-    caller can show *why* zero matches came back instead of just seeing 0.
+def count_unseen_from(imap, sender, debug=None):
+    """Returns (matched_count, total_unseen_count).
 
-    Yahoo's IMAP SEARCH is unreliable with compound criteria like
-    FROM "..." combined with SINCE - it frequently comes back OK with zero
-    UIDs even when matching mail exists. So we only let the server filter
-    by SINCE (which it handles fine), pull headers for that candidate set,
-    and match the sender ourselves in Python.
+    total_unseen_count is the raw UNSEEN count in the folder (free, from the
+    same SEARCH). matched_count is how many of those unseen messages have
+    `sender` as a substring of their From header - fetched only for the
+    unseen set, never the whole mailbox.
     """
-    since_date = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
-    criteria = f'(SINCE "{since_date}")'
-    if debug is not None:
-        debug["criteria"] = criteria
-        debug["sender_filter"] = sender
-
     try:
-        typ, data = imap.uid("search", None, criteria)
+        typ, data = imap.uid("search", None, "UNSEEN")
     except Exception as e:
         if debug is not None:
             debug["search_error"] = f"{type(e).__name__}: {e}"
-        return []
+        return 0, 0
 
     if debug is not None:
         debug["search_typ"] = typ
-        debug["search_raw"] = [d.decode(errors="replace") if isinstance(d, bytes) else str(d) for d in data]
 
     if typ != "OK" or not data or not data[0]:
-        if debug is not None:
-            debug["raw_uid_count"] = 0
-        return []
+        return 0, 0
 
     uids = data[0].split()
+    total_unseen = len(uids)
     uid_strs = [u.decode() if isinstance(u, bytes) else str(u) for u in uids]
 
     truncated = False
     if len(uid_strs) > MAX_CANDIDATES_PER_FOLDER:
-        # UIDs increase over time, so keep the newest ones rather than the
-        # oldest - on a shared/high-traffic seed mailbox this can otherwise
-        # mean fetching thousands of unrelated headers one folder at a time.
         uid_strs = uid_strs[-MAX_CANDIDATES_PER_FOLDER:]
         truncated = True
 
     if debug is not None:
-        debug["raw_uid_count"] = len(uids)
+        debug["total_unseen"] = total_unseen
         debug["candidates_fetched"] = len(uid_strs)
         debug["candidates_truncated"] = truncated
-        debug["dropped_no_date_header"] = 0
-        debug["dropped_date_parse_error"] = 0
-        debug["dropped_older_than_cutoff"] = 0
-        debug["dropped_sender_mismatch"] = 0
         debug["fetch_errors"] = []
         debug["fetch_batches"] = 0
-        debug["sample_from_headers"] = []  # actual From values seen, for eyeballing the real domain
         debug["aborted_time_budget"] = False
+        debug["sample_from_headers"] = []
 
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
     sender_needle = sender.strip().lower()
-    matches = []
+    matched = 0
     SAMPLE_CAP = 15
-
-    # Batch header fetches instead of one IMAP round-trip per message -
-    # a mailbox with real volume in the SINCE window made the old
-    # one-uid-at-a-time loop slow enough to look like a hang.
     BATCH_SIZE = 200
     start_time = time.monotonic()
 
@@ -189,9 +148,7 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
         if debug is not None:
             debug["fetch_batches"] += 1
         try:
-            typ, hdr_data = imap.uid(
-                "fetch", uid_set, "(UID BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM)])"
-            )
+            typ, hdr_data = imap.uid("fetch", uid_set, "(BODY.PEEK[HEADER.FIELDS (FROM)])")
         except Exception as e:
             if debug is not None:
                 debug["fetch_errors"].append(f"batch {uid_set[:40]}...: {type(e).__name__}: {e}")
@@ -203,125 +160,34 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
 
         for item in hdr_data:
             if not isinstance(item, tuple) or len(item) < 2:
-                continue  # skip the closing b')' entries IMAP includes per message
-            meta, raw_header = item[0], item[1]
-            uid_match = re.search(rb"UID (\d+)", meta)
-            uid = uid_match.group(1).decode() if uid_match else "?"
+                continue  # skip closing b')' entries IMAP includes per message
+            raw_header = item[1]
             try:
                 msg = email.message_from_bytes(raw_header)
-
                 from_ = msg.get("From", "")
                 if debug is not None and len(debug["sample_from_headers"]) < SAMPLE_CAP:
                     if from_ not in debug["sample_from_headers"]:
                         debug["sample_from_headers"].append(from_)
-                if sender_needle not in from_.lower():
-                    if debug is not None:
-                        debug["dropped_sender_mismatch"] += 1
-                    continue
-
-                date_hdr = msg.get("Date")
-                if not date_hdr:
-                    if debug is not None:
-                        debug["dropped_no_date_header"] += 1
-                    continue
-                try:
-                    dt = email.utils.parsedate_to_datetime(date_hdr)
-                except Exception as e:
-                    if debug is not None:
-                        debug["dropped_date_parse_error"] += 1
-                        debug["fetch_errors"].append(f"uid {uid}: bad Date header {date_hdr!r} ({e})")
-                    continue
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                if dt < cutoff:
-                    if debug is not None:
-                        debug["dropped_older_than_cutoff"] += 1
-                    continue
-                subject = msg.get("Subject", "(no subject)")
-                matches.append({"uid": uid.encode(), "subject": subject, "from": from_, "date": dt})
+                if sender_needle in from_.lower():
+                    matched += 1
             except Exception as e:
                 if debug is not None:
-                    debug["fetch_errors"].append(f"uid {uid}: {type(e).__name__}: {e}")
+                    debug["fetch_errors"].append(f"{type(e).__name__}: {e}")
                 continue
-    return matches
 
-
-def get_message_body(imap, uid):
-    try:
-        typ, msg_data = imap.uid("fetch", uid, "(RFC822)")
-        if typ != "OK" or not msg_data or not msg_data[0]:
-            return ""
-        raw = msg_data[0][1]
-        msg = email.message_from_bytes(raw)
-        parts = []
-        if msg.is_multipart():
-            for part in msg.walk():
-                ctype = part.get_content_type()
-                if ctype in ("text/plain", "text/html"):
-                    try:
-                        payload = part.get_payload(decode=True)
-                        if payload:
-                            parts.append(payload.decode(part.get_content_charset() or "utf-8", errors="ignore"))
-                    except Exception:
-                        continue
-        else:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                parts.append(payload.decode(msg.get_content_charset() or "utf-8", errors="ignore"))
-        return "\n".join(parts)
-    except Exception:
-        return ""
-
-
-def extract_links(body):
-    links = re.findall(r'https?://[^\s"\'<>\)]+', body, flags=re.IGNORECASE)
-    return list(dict.fromkeys(links))  # dedupe, preserve order
-
-
-def click_via_requests(url):
-    try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20, allow_redirects=True)
-        return r.status_code < 400
-    except Exception:
-        return False
-
-
-def click_via_headless(url):
-    try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            page = browser.new_page(user_agent=USER_AGENT)
-            page.goto(url, wait_until="networkidle", timeout=25000)
-            page.wait_for_timeout(2000)
-            page.close()
-            browser.close()
-        return True
-    except Exception:
-        return False
-
-
-def click_link(url):
-    if click_via_requests(url):
-        return "http"
-    if click_via_headless(url):
-        return "headless"
-    return "failed"
+    return matched, total_unseen
 
 
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
-st.title("Seed Inbox Placement Checker")
-st.caption("Yahoo IMAP · checks Inbox vs Spam placement in the last 24 hours · clicks links in matched emails")
-
-ensure_playwright_browser()
+st.title("Seed Unread Count Checker")
+st.caption("Yahoo IMAP · unread-from-sender count in Inbox + Spam/Bulk per account")
 
 accounts_file = st.file_uploader("Accounts file (CSV/TXT — one \"email,password\" per line)", type=["csv", "txt"])
 sender = st.text_input("Sender address or domain to track", placeholder="yourdomain.com")
-debug_mode = st.checkbox("Show debug info (raw IMAP search counts / drop reasons)", value=False)
+debug_mode = st.checkbox("Show debug info", value=False)
 run = st.button("Run Check", type="primary")
 
 if run:
@@ -335,137 +201,95 @@ if run:
             st.error('No valid accounts found in file. Expected one "email,password" per line.')
         else:
             results = []
-            total_inbox = 0
-            total_spam = 0
+            grand_inbox_matched = 0
+            grand_spam_matched = 0
 
             progress = st.progress(0.0, text="Starting...")
             for i, (acc_email, acc_pass) in enumerate(accounts):
-                progress.progress((i) / len(accounts), text=f"Checking {acc_email}: connecting...")
-                account_result = {"email": acc_email, "status": "ok", "messages": [], "debug": {}}
+                progress.progress(i / len(accounts), text=f"Checking {acc_email}: inbox...")
+                acct = {"email": acc_email, "status": "ok", "debug": {}}
 
                 inbox_debug = {}
                 inbox_conn = open_mailbox(acc_email, acc_pass, "INBOX", debug=inbox_debug)
-                account_result["debug"]["inbox"] = inbox_debug
+                acct["debug"]["inbox"] = inbox_debug
                 if not inbox_conn:
-                    account_result["status"] = "auth_failed"
-                    results.append(account_result)
+                    acct["status"] = "auth_failed"
+                    results.append(acct)
                     continue
 
-                progress.progress((i) / len(accounts), text=f"Checking {acc_email}: searching inbox...")
-                inbox_search_debug = {}
-                for m in search_recent_from(inbox_conn, sender, LOOKBACK_SECONDS, debug=inbox_search_debug):
-                    body = get_message_body(inbox_conn, m["uid"])
-                    links = extract_links(body)
-                    clicks = [{"url": link, "method": click_link(link)} for link in links]
-                    account_result["messages"].append(
-                        {
-                            "folder": "Inbox",
-                            "subject": m["subject"],
-                            "from": m["from"],
-                            "date": m["date"].strftime("%Y-%m-%d %H:%M"),
-                            "links_clicked": clicks,
-                        }
-                    )
-                    total_inbox += 1
-                account_result["debug"]["inbox_search"] = inbox_search_debug
+                inbox_matched, inbox_total_unseen = count_unseen_from(inbox_conn, sender, debug=inbox_debug)
+                acct["inbox_matched"] = inbox_matched
+                acct["inbox_total_unseen"] = inbox_total_unseen
                 try:
                     inbox_conn.logout()
                 except Exception:
                     pass
 
                 spam_folder = find_spam_folder(acc_email, acc_pass)
-                account_result["debug"]["spam_folder_found"] = spam_folder
+                acct["spam_folder"] = spam_folder
+                acct["spam_matched"] = 0
+                acct["spam_total_unseen"] = 0
                 if spam_folder:
-                    progress.progress((i) / len(accounts), text=f"Checking {acc_email}: searching {spam_folder}...")
+                    progress.progress(i / len(accounts), text=f"Checking {acc_email}: {spam_folder}...")
                     spam_debug = {}
                     spam_conn = open_mailbox(acc_email, acc_pass, spam_folder, debug=spam_debug)
-                    account_result["debug"]["spam"] = spam_debug
+                    acct["debug"]["spam"] = spam_debug
                     if spam_conn:
-                        spam_search_debug = {}
-                        for m in search_recent_from(spam_conn, sender, LOOKBACK_SECONDS, debug=spam_search_debug):
-                            body = get_message_body(spam_conn, m["uid"])
-                            links = extract_links(body)
-                            clicks = [{"url": link, "method": click_link(link)} for link in links]
-                            account_result["messages"].append(
-                                {
-                                    "folder": spam_folder,
-                                    "subject": m["subject"],
-                                    "from": m["from"],
-                                    "date": m["date"].strftime("%Y-%m-%d %H:%M"),
-                                    "links_clicked": clicks,
-                                }
-                            )
-                            total_spam += 1
-                        account_result["debug"]["spam_search"] = spam_search_debug
+                        spam_matched, spam_total_unseen = count_unseen_from(spam_conn, sender, debug=spam_debug)
+                        acct["spam_matched"] = spam_matched
+                        acct["spam_total_unseen"] = spam_total_unseen
                         try:
                             spam_conn.logout()
                         except Exception:
                             pass
 
-                results.append(account_result)
+                grand_inbox_matched += acct["inbox_matched"]
+                grand_spam_matched += acct["spam_matched"]
+                results.append(acct)
 
             progress.progress(1.0, text="Done")
             progress.empty()
 
-            total_found = total_inbox + total_spam
-            inbox_pct = round((total_inbox / total_found) * 100, 1) if total_found else 0
-            spam_pct = round((total_spam / total_found) * 100, 1) if total_found else 0
-
+            total_matched = grand_inbox_matched + grand_spam_matched
             c1, c2, c3 = st.columns(3)
-            c1.metric("Total Found (24h)", total_found)
-            c2.metric("Landed in Inbox", f"{total_inbox} ({inbox_pct}%)")
-            c3.metric("Landed in Spam", f"{total_spam} ({spam_pct}%)")
+            c1.metric("Unread in Inbox", grand_inbox_matched)
+            c2.metric("Unread in Spam/Bulk", grand_spam_matched)
+            c3.metric("Total Unread (from sender)", total_matched)
 
             st.divider()
 
-            for acct in results:
-                match_count = len(acct["messages"])
-                header_status = acct["status"] if acct["status"] != "ok" else f"{match_count} match(es)"
-                with st.expander(f"{acct['email']} — {header_status}"):
-                    if debug_mode:
-                        st.json(acct.get("debug", {}))
-                    if acct["status"] != "ok":
-                        st.error(acct["status"])
-                        continue
-                    if not acct["messages"]:
-                        st.write("No matching email in last 24h.")
-                        continue
-                    for msg in acct["messages"]:
-                        badge = "🟢 Inbox" if msg["folder"] == "Inbox" else f"🟠 {msg['folder']}"
-                        st.markdown(f"**{badge}** — {msg['subject']}  \n"
-                                    f"From: {msg['from']} · Received: {msg['date']}")
-                        if msg["links_clicked"]:
-                            for lc in msg["links_clicked"]:
-                                icon = {"http": "✅", "headless": "🌐", "failed": "❌"}[lc["method"]]
-                                st.caption(f"{icon} {lc['method']}: {lc['url'][:80]}")
-                        else:
-                            st.caption("no links found")
-                        st.markdown("---")
-
-                    # per-account mini breakdown
-                    acct_inbox = sum(1 for m in acct["messages"] if m["folder"] == "Inbox")
-                    acct_spam = len(acct["messages"]) - acct_inbox
-                    st.caption(f"This account: {acct_inbox} inbox / {acct_spam} spam")
-
-            st.divider()
-            csv_lines = ["email,folder,subject,from,date,links_clicked,links_failed"]
+            rows = []
             for acct in results:
                 if acct["status"] != "ok":
-                    csv_lines.append(f'{acct["email"]},AUTH_FAILED,,,,,')
+                    st.error(f"{acct['email']}: {acct['status']}")
+                    if debug_mode:
+                        st.json(acct["debug"])
                     continue
-                for msg in acct["messages"]:
-                    ok_links = sum(1 for lc in msg["links_clicked"] if lc["method"] != "failed")
-                    failed_links = sum(1 for lc in msg["links_clicked"] if lc["method"] == "failed")
-                    subject_clean = msg["subject"].replace(",", ";").replace("\n", " ")
-                    from_clean = msg["from"].replace(",", ";")
-                    csv_lines.append(
-                        f'{acct["email"]},{msg["folder"]},{subject_clean},{from_clean},'
-                        f'{msg["date"]},{ok_links},{failed_links}'
-                    )
-            csv_data = "\n".join(csv_lines)
+                rows.append({
+                    "Account": acct["email"],
+                    "Unread (Inbox)": acct["inbox_matched"],
+                    "Unread (Spam/Bulk)": acct["spam_matched"],
+                    "Total unread (all senders, Inbox)": acct["inbox_total_unseen"],
+                    "Total unread (all senders, Spam)": acct["spam_total_unseen"],
+                })
+                if debug_mode:
+                    with st.expander(f"{acct['email']} — debug"):
+                        st.json(acct["debug"])
+
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+            csv_lines = ["email,inbox_unread_matched,spam_unread_matched,inbox_total_unseen,spam_total_unseen"]
+            for acct in results:
+                if acct["status"] != "ok":
+                    csv_lines.append(f'{acct["email"]},AUTH_FAILED,,,')
+                    continue
+                csv_lines.append(
+                    f'{acct["email"]},{acct["inbox_matched"]},{acct["spam_matched"]},'
+                    f'{acct["inbox_total_unseen"]},{acct["spam_total_unseen"]}'
+                )
             st.download_button(
                 "Download results (CSV)",
-                data=csv_data,
-                file_name=f"seed_placement_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                data="\n".join(csv_lines),
+                file_name=f"unread_counts_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv",
             )
