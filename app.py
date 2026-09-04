@@ -12,9 +12,15 @@ never the message bodies, no link-clicking.
 
 Per account, once you see a nonzero count, an "Open email & click links"
 button fetches the actual matched message(s) for that account, extracts
-links from the body, and clicks each one (plain HTTP request first, headless
-Chromium via Playwright as a fallback if that fails) - only for that one
-account, only on demand.
+links from the body, and clicks them with a real headless browser
+(Playwright) - only for that one account, only on demand.
+
+Optional: give a "Link to match" value. When set, only the first link in
+each message that CONTAINS that value (substring match, not exact) is
+clicked - every other link in the message is skipped. After a message's
+matched link is clicked, that message is marked as read (\\Seen) on the
+server. If no target is given, the old behavior applies: every link gets
+clicked and messages aren't marked read.
 
 Deploy on Streamlit Community Cloud:
   - requirements.txt -> streamlit, requests, playwright
@@ -88,11 +94,11 @@ def parse_accounts_file(uploaded_file):
     return accounts
 
 
-def open_mailbox(email_addr, password, folder="INBOX", debug=None):
+def open_mailbox(email_addr, password, folder="INBOX", debug=None, readonly=True):
     try:
         imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
         imap.login(email_addr, password)
-        typ, sel_data = imap.select(folder, readonly=True)
+        typ, sel_data = imap.select(folder, readonly=readonly)
         if typ != "OK":
             if debug is not None:
                 debug["select_error"] = f"SELECT {folder} -> {typ} {sel_data}"
@@ -252,6 +258,35 @@ def extract_links(body):
     return list(dict.fromkeys(links))  # dedupe, preserve order
 
 
+def select_links_to_click(links, target_link):
+    """Given all links found in a message body (in document order) and an
+    optional target substring, return the list of links that should actually
+    be clicked.
+
+    - No target -> click every link (old behavior).
+    - Target given -> substring match (case-insensitive, not exact) against
+      each link; return only the FIRST match, as a single-item list. Empty
+      list if nothing matches.
+    """
+    if not target_link:
+        return links
+    needle = target_link.strip().lower()
+    if not needle:
+        return links
+    for link in links:
+        if needle in link.lower():
+            return [link]
+    return []
+
+
+def mark_seen(conn, uid):
+    try:
+        conn.uid("store", uid, "+FLAGS", "(\\Seen)")
+        return True
+    except Exception:
+        return False
+
+
 def click_via_requests(url):
     try:
         r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20, allow_redirects=True)
@@ -260,14 +295,21 @@ def click_via_requests(url):
         return False
 
 
-def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spam_uids, on_progress=None):
+def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spam_uids,
+                                target_link=None, on_progress=None):
     """Fetches only the specific matched messages for this account (Inbox +
     Spam/Bulk) and clicks the links inside each using one real headless
     browser session for the whole run (much faster than a new browser per
     link, and it's the actual browser navigating, not just an HTTP request).
-    Falls back to a plain request if the browser navigation itself fails,
-    or if Playwright isn't installed in this deployment at all. Runs only
-    when the user presses the button for this account.
+    Falls back to a plain request only if the browser navigation itself
+    fails, or if Playwright isn't installed in this deployment at all.
+    Runs only when the user presses the button for this account.
+
+    If `target_link` is given, only the first link in each message that
+    contains that value (substring match) is clicked, and the message is
+    then marked as read on the server. Every other link in the message is
+    left alone. If `target_link` is not given, every link is clicked (old
+    behavior) and nothing is marked read.
 
     on_progress(opened, total_messages, clicked), if given, is called after
     every message is opened and after every link click so the caller can
@@ -301,12 +343,29 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
                 counts["opened"] += 1
                 if on_progress:
                     on_progress(counts["opened"], total_msgs, counts["clicked"])
-                links = extract_links(m["body"])
-                clicks = [{"url": link, "method": click_one(link)} for link in links]
-                messages.append({"folder": folder_label, "subject": m["subject"], "from": m["from"], "links": clicks})
 
+                all_links = extract_links(m["body"])
+                links_to_click = select_links_to_click(all_links, target_link)
+                clicks = [{"url": link, "method": click_one(link)} for link in links_to_click]
+
+                no_match = bool(target_link) and not clicks
+                marked_read = False
+                if clicks:
+                    marked_read = mark_seen(conn, uid)
+
+                messages.append({
+                    "folder": folder_label,
+                    "subject": m["subject"],
+                    "from": m["from"],
+                    "links": clicks,
+                    "no_match": no_match,
+                    "marked_read": marked_read,
+                })
+
+        # Open with readonly=False here (unlike the count pass) so a
+        # successful click can flip \Seen on the message.
         if inbox_uids:
-            conn = open_mailbox(acc_email, acc_pass, "INBOX")
+            conn = open_mailbox(acc_email, acc_pass, "INBOX", readonly=False)
             if conn:
                 process_folder("Inbox", conn, inbox_uids)
                 try:
@@ -315,7 +374,7 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
                     pass
 
         if spam_folder and spam_uids:
-            conn = open_mailbox(acc_email, acc_pass, spam_folder)
+            conn = open_mailbox(acc_email, acc_pass, spam_folder, readonly=False)
             if conn:
                 process_folder(spam_folder, conn, spam_uids)
                 try:
@@ -361,6 +420,13 @@ if not PLAYWRIGHT_AVAILABLE:
 
 accounts_file = st.file_uploader("Accounts file (CSV/TXT — one \"email,password\" per line)", type=["csv", "txt"])
 sender = st.text_input("Sender address or domain to track", placeholder="yourdomain.com")
+target_link = st.text_input(
+    "Link to match (optional)",
+    placeholder="leave blank to click every link",
+    help="If set, only the first link in each message that CONTAINS this value is clicked "
+         "(substring match, not exact). That message is then marked as read. All other links "
+         "are skipped. Leave blank to click every link (old behavior, nothing marked read).",
+)
 debug_mode = st.checkbox("Show debug info", value=False)
 run = st.button("Run Check", type="primary")
 
@@ -484,6 +550,7 @@ if "results" in st.session_state:
             messages = open_and_click_for_account(
                 acct["email"], acct["password"],
                 acct["inbox_uids"], acct["spam_folder"], acct["spam_uids"],
+                target_link=target_link.strip() if target_link else None,
                 on_progress=progress_cb,
             )
             progress_bar.empty()
@@ -504,6 +571,10 @@ if "results" in st.session_state:
                     for lc in msg["links"]:
                         icon = {"browser": "🌐", "http": "✅", "failed": "❌"}[lc["method"]]
                         st.caption(f"{icon} {lc['method']}: {lc['url'][:80]}")
+                    if msg.get("marked_read"):
+                        st.caption("✔️ marked as read")
+                elif msg.get("no_match"):
+                    st.caption("no link matching target found in this message")
                 else:
                     st.caption("no links found in this message")
 
