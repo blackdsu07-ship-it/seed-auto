@@ -37,6 +37,7 @@ import email
 import imaplib
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime
 
@@ -67,13 +68,24 @@ st.set_page_config(page_title="Seed Unread Count Checker", layout="wide")
 # Playwright setup (installed lazily - only when a click action first needs it)
 # ---------------------------------------------------------------------------
 
-@st.cache_resource
 def ensure_playwright_browser():
+    """Installs the Chromium build Playwright drives. Uses `sys.executable -m
+    playwright` instead of a bare `playwright` command, since on Windows the
+    `playwright` console script often isn't on PATH even when the package is
+    installed in the active venv - a bare `subprocess.run(["playwright", ...])`
+    just raises FileNotFoundError, which looks identical to "nothing went
+    wrong" if you swallow it. Returns (ok, output) so the caller can surface
+    a real reason instead of guessing.
+    """
     try:
-        subprocess.run(["playwright", "install", "chromium"], check=False, timeout=180)
-    except Exception:
-        pass
-    return True
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=180,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        return result.returncode == 0, output.strip()
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +335,7 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
     messages = []
     total_msgs = len(inbox_uids) + len(spam_uids)
     counts = {"opened": 0, "clicked": 0}
+    status = {"used_headed_browser": False, "install_ok": None, "install_output": "", "launch_error": None}
 
     def run(page):
         def click_one(url):
@@ -331,7 +344,8 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
                     page.goto(url, wait_until="networkidle", timeout=25000)
                     page.wait_for_timeout(1500)
                     method = "browser"
-                except Exception:
+                except Exception as e:
+                    status.setdefault("nav_errors", []).append(f"{url[:80]}: {type(e).__name__}: {e}")
                     method = "http" if click_via_requests(url) else "failed"
             else:
                 method = "http" if click_via_requests(url) else "failed"
@@ -388,23 +402,29 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
                     pass
 
     if PLAYWRIGHT_AVAILABLE:
-        ensure_playwright_browser()
+        install_ok, install_output = ensure_playwright_browser()
+        status["install_ok"] = install_ok
+        status["install_output"] = install_output
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=False, args=["--start-maximized"])
                 page = browser.new_page(user_agent=USER_AGENT, no_viewport=True)
+                status["used_headed_browser"] = True
                 run(page)
                 page.close()
                 browser.close()
-        except Exception:
+        except Exception as e:
             # Browser binary missing/failed to launch even though the package
             # imported fine - fall back to requests-only for this run rather
-            # than losing all progress made so far.
+            # than losing all progress made so far, but keep the real reason
+            # instead of failing silently.
+            status["launch_error"] = f"{type(e).__name__}: {e}"
             run(None)
     else:
+        status["launch_error"] = "playwright package not importable in this environment"
         run(None)
 
-    return messages
+    return messages, status
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +572,7 @@ if "results" in st.session_state:
                     f"📨 Opened **{opened}/{total}** emails · 🔗 Clicked **{clicked}** links"
                 )
 
-            messages = open_and_click_for_account(
+            messages, browser_status = open_and_click_for_account(
                 acct["email"], acct["password"],
                 acct["inbox_uids"], acct["spam_folder"], acct["spam_uids"],
                 target_link=target_link.strip() if target_link else None,
@@ -563,6 +583,18 @@ if "results" in st.session_state:
             status_placeholder.markdown(
                 f"✅ Done — opened **{len(messages)}/{total_msgs}** emails, clicked **{total_clicked}** links"
             )
+            if not browser_status["used_headed_browser"]:
+                st.error(
+                    "A visible browser window never opened for this run — links were clicked via "
+                    "plain HTTP requests instead. Reason: "
+                    f"`{browser_status['launch_error']}`"
+                )
+                if browser_status["install_ok"] is False:
+                    st.caption(f"Chromium install also failed: {browser_status['install_output'][:500]}")
+            if browser_status.get("nav_errors"):
+                with st.expander(f"{acct['email']} — browser navigation errors"):
+                    for err in browser_status["nav_errors"]:
+                        st.caption(err)
             st.session_state[f"click_result_{acct['email']}"] = messages
 
         result_key = f"click_result_{acct['email']}"
