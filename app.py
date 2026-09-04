@@ -254,66 +254,73 @@ def click_via_requests(url):
         return False
 
 
-def click_via_headless(url):
-    try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            page = browser.new_page(user_agent=USER_AGENT)
-            page.goto(url, wait_until="networkidle", timeout=25000)
-            page.wait_for_timeout(2000)
-            page.close()
-            browser.close()
-        return True
-    except Exception:
-        return False
-
-
-def click_link(url):
-    if click_via_requests(url):
-        return "http"
-    if click_via_headless(url):
-        return "headless"
-    return "failed"
-
-
-def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spam_uids):
+def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spam_uids, on_progress=None):
     """Fetches only the specific matched messages for this account (Inbox +
-    Spam/Bulk) and clicks the links inside each. Runs only when the user
-    presses the button for this account."""
+    Spam/Bulk) and clicks the links inside each using one real headless
+    browser session for the whole run (much faster than a new browser per
+    link, and it's the actual browser navigating, not just an HTTP request).
+    Falls back to a plain request only if the browser navigation itself
+    fails. Runs only when the user presses the button for this account.
+
+    on_progress(opened, total_messages, clicked), if given, is called after
+    every message is opened and after every link click so the caller can
+    show live counts.
+    """
     ensure_playwright_browser()
     messages = []
+    total_msgs = len(inbox_uids) + len(spam_uids)
+    counts = {"opened": 0, "clicked": 0}
 
-    if inbox_uids:
-        conn = open_mailbox(acc_email, acc_pass, "INBOX")
-        if conn:
-            for uid in inbox_uids:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+        page = browser.new_page(user_agent=USER_AGENT)
+
+        def click_one(url):
+            try:
+                page.goto(url, wait_until="networkidle", timeout=25000)
+                page.wait_for_timeout(1500)
+                method = "browser"
+            except Exception:
+                method = "http" if click_via_requests(url) else "failed"
+            counts["clicked"] += 1
+            if on_progress:
+                on_progress(counts["opened"], total_msgs, counts["clicked"])
+            return method
+
+        def process_folder(folder_label, conn, uids):
+            for uid in uids:
                 m = get_message_full(conn, uid)
                 if not m:
                     continue
+                counts["opened"] += 1
+                if on_progress:
+                    on_progress(counts["opened"], total_msgs, counts["clicked"])
                 links = extract_links(m["body"])
-                clicks = [{"url": link, "method": click_link(link)} for link in links]
-                messages.append({"folder": "Inbox", "subject": m["subject"], "from": m["from"], "links": clicks})
-            try:
-                conn.logout()
-            except Exception:
-                pass
+                clicks = [{"url": link, "method": click_one(link)} for link in links]
+                messages.append({"folder": folder_label, "subject": m["subject"], "from": m["from"], "links": clicks})
 
-    if spam_folder and spam_uids:
-        conn = open_mailbox(acc_email, acc_pass, spam_folder)
-        if conn:
-            for uid in spam_uids:
-                m = get_message_full(conn, uid)
-                if not m:
-                    continue
-                links = extract_links(m["body"])
-                clicks = [{"url": link, "method": click_link(link)} for link in links]
-                messages.append({"folder": spam_folder, "subject": m["subject"], "from": m["from"], "links": clicks})
-            try:
-                conn.logout()
-            except Exception:
-                pass
+        if inbox_uids:
+            conn = open_mailbox(acc_email, acc_pass, "INBOX")
+            if conn:
+                process_folder("Inbox", conn, inbox_uids)
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+
+        if spam_folder and spam_uids:
+            conn = open_mailbox(acc_email, acc_pass, spam_folder)
+            if conn:
+                process_folder(spam_folder, conn, spam_uids)
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+
+        page.close()
+        browser.close()
 
     return messages
 
@@ -435,12 +442,29 @@ if "results" in st.session_state:
             )
 
         if click_pressed:
-            with st.spinner(f"Opening matched email(s) for {acct['email']}..."):
-                messages = open_and_click_for_account(
-                    acct["email"], acct["password"],
-                    acct["inbox_uids"], acct["spam_folder"], acct["spam_uids"],
+            total_msgs = len(acct["inbox_uids"]) + len(acct["spam_uids"])
+            status_placeholder = st.empty()
+            progress_bar = st.progress(0.0)
+            status_placeholder.markdown(f"📨 Opened **0/{total_msgs}** emails · 🔗 Clicked **0** links")
+
+            def progress_cb(opened, total, clicked):
+                frac = (opened / total) if total else 1.0
+                progress_bar.progress(min(frac, 1.0))
+                status_placeholder.markdown(
+                    f"📨 Opened **{opened}/{total}** emails · 🔗 Clicked **{clicked}** links"
                 )
-                st.session_state[f"click_result_{acct['email']}"] = messages
+
+            messages = open_and_click_for_account(
+                acct["email"], acct["password"],
+                acct["inbox_uids"], acct["spam_folder"], acct["spam_uids"],
+                on_progress=progress_cb,
+            )
+            progress_bar.empty()
+            total_clicked = sum(len(m["links"]) for m in messages)
+            status_placeholder.markdown(
+                f"✅ Done — opened **{len(messages)}/{total_msgs}** emails, clicked **{total_clicked}** links"
+            )
+            st.session_state[f"click_result_{acct['email']}"] = messages
 
         result_key = f"click_result_{acct['email']}"
         if result_key in st.session_state:
@@ -451,7 +475,7 @@ if "results" in st.session_state:
                 st.markdown(f"🟢 **{msg['folder']}** — {msg['subject']}  \nFrom: {msg['from']}")
                 if msg["links"]:
                     for lc in msg["links"]:
-                        icon = {"http": "✅", "headless": "🌐", "failed": "❌"}[lc["method"]]
+                        icon = {"browser": "🌐", "http": "✅", "failed": "❌"}[lc["method"]]
                         st.caption(f"{icon} {lc['method']}: {lc['url'][:80]}")
                 else:
                     st.caption("no links found in this message")
