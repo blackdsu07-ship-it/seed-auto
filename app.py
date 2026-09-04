@@ -312,7 +312,7 @@ def click_via_requests(url):
 
 
 def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spam_uids,
-                                target_link=None, on_progress=None):
+                                target_link=None, on_progress=None, on_browser_status=None):
     """Fetches only the specific matched messages for this account (Inbox +
     Spam/Bulk) and clicks the links inside each using one real, VISIBLE
     Chromium window (headless=False) for the whole run - not headless, so
@@ -331,6 +331,12 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
     on_progress(opened, total_messages, clicked), if given, is called after
     every message is opened and after every link click so the caller can
     show live counts.
+
+    on_browser_status(stage, ok, detail), if given, is called twice, BEFORE
+    any message processing starts, so the caller can show the launch result
+    immediately instead of waiting for the whole run to finish:
+      - ("install", True/False, output text)
+      - ("launch", True/False, error text or "")
     """
     messages = []
     total_msgs = len(inbox_uids) + len(spam_uids)
@@ -405,12 +411,20 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
         install_ok, install_output = ensure_playwright_browser()
         status["install_ok"] = install_ok
         status["install_output"] = install_output
+        if on_browser_status:
+            on_browser_status("install", install_ok, install_output)
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=False, args=["--start-maximized"])
                 page = browser.new_page(user_agent=USER_AGENT, no_viewport=True)
+                page.bring_to_front()
                 status["used_headed_browser"] = True
+                if on_browser_status:
+                    on_browser_status("launch", True, "")
                 run(page)
+                # Keep the window up for a moment after the last click so it
+                # doesn't just flash and vanish before you can see it.
+                page.wait_for_timeout(2000)
                 page.close()
                 browser.close()
         except Exception as e:
@@ -419,9 +433,13 @@ def open_and_click_for_account(acc_email, acc_pass, inbox_uids, spam_folder, spa
             # than losing all progress made so far, but keep the real reason
             # instead of failing silently.
             status["launch_error"] = f"{type(e).__name__}: {e}"
+            if on_browser_status:
+                on_browser_status("launch", False, status["launch_error"])
             run(None)
     else:
         status["launch_error"] = "playwright package not importable in this environment"
+        if on_browser_status:
+            on_browser_status("launch", False, status["launch_error"])
         run(None)
 
     return messages, status
@@ -561,8 +579,10 @@ if "results" in st.session_state:
 
         if click_pressed:
             total_msgs = len(acct["inbox_uids"]) + len(acct["spam_uids"])
+            browser_status_placeholder = st.empty()
             status_placeholder = st.empty()
             progress_bar = st.progress(0.0)
+            browser_status_placeholder.markdown("⏳ Checking Chromium install...")
             status_placeholder.markdown(f"📨 Opened **0/{total_msgs}** emails · 🔗 Clicked **0** links")
 
             def progress_cb(opened, total, clicked):
@@ -572,11 +592,23 @@ if "results" in st.session_state:
                     f"📨 Opened **{opened}/{total}** emails · 🔗 Clicked **{clicked}** links"
                 )
 
+            def browser_status_cb(stage, ok, detail):
+                if stage == "install":
+                    browser_status_placeholder.markdown(
+                        "✅ Chromium install OK" if ok else f"❌ Chromium install failed: `{detail[:300]}`"
+                    )
+                elif stage == "launch":
+                    browser_status_placeholder.markdown(
+                        "🖥️ Browser window launched — look for it now (check your taskbar too)"
+                        if ok else f"❌ Browser launch failed: `{detail}`"
+                    )
+
             messages, browser_status = open_and_click_for_account(
                 acct["email"], acct["password"],
                 acct["inbox_uids"], acct["spam_folder"], acct["spam_uids"],
                 target_link=target_link.strip() if target_link else None,
                 on_progress=progress_cb,
+                on_browser_status=browser_status_cb,
             )
             progress_bar.empty()
             total_clicked = sum(len(m["links"]) for m in messages)
