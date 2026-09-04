@@ -26,6 +26,7 @@ import streamlit as st
 
 IMAP_HOST = "imap.mail.yahoo.com"
 IMAP_PORT = 993
+IMAP_TIMEOUT = 20  # seconds - without this a stuck connection hangs forever
 SPAM_FOLDER_CANDIDATES = ["Bulk", "Bulk Mail", "Spam", "Junk"]
 LOOKBACK_SECONDS = 24 * 60 * 60
 USER_AGENT = (
@@ -73,7 +74,7 @@ def parse_accounts_file(uploaded_file):
 
 def open_mailbox(email_addr, password, folder="INBOX", debug=None):
     try:
-        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
         imap.login(email_addr, password)
         typ, sel_data = imap.select(folder, readonly=True)
         if typ != "OK":
@@ -90,7 +91,7 @@ def open_mailbox(email_addr, password, folder="INBOX", debug=None):
 
 def find_spam_folder(email_addr, password):
     try:
-        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
         imap.login(email_addr, password)
         typ, folders = imap.list()
         imap.logout()
@@ -148,52 +149,75 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
         debug["dropped_older_than_cutoff"] = 0
         debug["dropped_sender_mismatch"] = 0
         debug["fetch_errors"] = []
+        debug["fetch_batches"] = 0
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
     sender_needle = sender.strip().lower()
     matches = []
-    for uid in uids:
+
+    # Batch header fetches instead of one IMAP round-trip per message -
+    # a mailbox with real volume in the SINCE window made the old
+    # one-uid-at-a-time loop slow enough to look like a hang.
+    BATCH_SIZE = 200
+    uid_strs = [u.decode() if isinstance(u, bytes) else str(u) for u in uids]
+
+    for i in range(0, len(uid_strs), BATCH_SIZE):
+        batch = uid_strs[i:i + BATCH_SIZE]
+        uid_set = ",".join(batch)
+        if debug is not None:
+            debug["fetch_batches"] += 1
         try:
             typ, hdr_data = imap.uid(
-                "fetch", uid, "(BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM)])"
+                "fetch", uid_set, "(UID BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM)])"
             )
-            if typ != "OK" or not hdr_data or not hdr_data[0]:
-                if debug is not None:
-                    debug["fetch_errors"].append(f"uid {uid}: fetch typ={typ}")
-                continue
-            raw_header = hdr_data[0][1]
-            msg = email.message_from_bytes(raw_header)
-
-            from_ = msg.get("From", "")
-            if sender_needle not in from_.lower():
-                if debug is not None:
-                    debug["dropped_sender_mismatch"] += 1
-                continue
-
-            date_hdr = msg.get("Date")
-            if not date_hdr:
-                if debug is not None:
-                    debug["dropped_no_date_header"] += 1
-                continue
-            try:
-                dt = email.utils.parsedate_to_datetime(date_hdr)
-            except Exception as e:
-                if debug is not None:
-                    debug["dropped_date_parse_error"] += 1
-                    debug["fetch_errors"].append(f"uid {uid}: bad Date header {date_hdr!r} ({e})")
-                continue
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            if dt < cutoff:
-                if debug is not None:
-                    debug["dropped_older_than_cutoff"] += 1
-                continue
-            subject = msg.get("Subject", "(no subject)")
-            matches.append({"uid": uid, "subject": subject, "from": from_, "date": dt})
         except Exception as e:
             if debug is not None:
-                debug["fetch_errors"].append(f"uid {uid}: {type(e).__name__}: {e}")
+                debug["fetch_errors"].append(f"batch {uid_set[:40]}...: {type(e).__name__}: {e}")
             continue
+        if typ != "OK" or not hdr_data:
+            if debug is not None:
+                debug["fetch_errors"].append(f"batch {uid_set[:40]}...: fetch typ={typ}")
+            continue
+
+        for item in hdr_data:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue  # skip the closing b')' entries IMAP includes per message
+            meta, raw_header = item[0], item[1]
+            uid_match = re.search(rb"UID (\d+)", meta)
+            uid = uid_match.group(1).decode() if uid_match else "?"
+            try:
+                msg = email.message_from_bytes(raw_header)
+
+                from_ = msg.get("From", "")
+                if sender_needle not in from_.lower():
+                    if debug is not None:
+                        debug["dropped_sender_mismatch"] += 1
+                    continue
+
+                date_hdr = msg.get("Date")
+                if not date_hdr:
+                    if debug is not None:
+                        debug["dropped_no_date_header"] += 1
+                    continue
+                try:
+                    dt = email.utils.parsedate_to_datetime(date_hdr)
+                except Exception as e:
+                    if debug is not None:
+                        debug["dropped_date_parse_error"] += 1
+                        debug["fetch_errors"].append(f"uid {uid}: bad Date header {date_hdr!r} ({e})")
+                    continue
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt < cutoff:
+                    if debug is not None:
+                        debug["dropped_older_than_cutoff"] += 1
+                    continue
+                subject = msg.get("Subject", "(no subject)")
+                matches.append({"uid": uid.encode(), "subject": subject, "from": from_, "date": dt})
+            except Exception as e:
+                if debug is not None:
+                    debug["fetch_errors"].append(f"uid {uid}: {type(e).__name__}: {e}")
+                continue
     return matches
 
 
@@ -291,7 +315,7 @@ if run:
 
             progress = st.progress(0.0, text="Starting...")
             for i, (acc_email, acc_pass) in enumerate(accounts):
-                progress.progress((i) / len(accounts), text=f"Checking {acc_email}...")
+                progress.progress((i) / len(accounts), text=f"Checking {acc_email}: connecting...")
                 account_result = {"email": acc_email, "status": "ok", "messages": [], "debug": {}}
 
                 inbox_debug = {}
@@ -302,6 +326,7 @@ if run:
                     results.append(account_result)
                     continue
 
+                progress.progress((i) / len(accounts), text=f"Checking {acc_email}: searching inbox...")
                 inbox_search_debug = {}
                 for m in search_recent_from(inbox_conn, sender, LOOKBACK_SECONDS, debug=inbox_search_debug):
                     body = get_message_body(inbox_conn, m["uid"])
@@ -326,6 +351,7 @@ if run:
                 spam_folder = find_spam_folder(acc_email, acc_pass)
                 account_result["debug"]["spam_folder_found"] = spam_folder
                 if spam_folder:
+                    progress.progress((i) / len(accounts), text=f"Checking {acc_email}: searching {spam_folder}...")
                     spam_debug = {}
                     spam_conn = open_mailbox(acc_email, acc_pass, spam_folder, debug=spam_debug)
                     account_result["debug"]["spam"] = spam_debug
