@@ -110,11 +110,19 @@ def find_spam_folder(email_addr, password):
 
 def search_recent_from(imap, sender, lookback_seconds, debug=None):
     """debug, if passed a dict, gets populated with diagnostics so the
-    caller can show *why* zero matches came back instead of just seeing 0."""
+    caller can show *why* zero matches came back instead of just seeing 0.
+
+    Yahoo's IMAP SEARCH is unreliable with compound criteria like
+    FROM "..." combined with SINCE - it frequently comes back OK with zero
+    UIDs even when matching mail exists. So we only let the server filter
+    by SINCE (which it handles fine), pull headers for that candidate set,
+    and match the sender ourselves in Python.
+    """
     since_date = (datetime.now() - timedelta(days=2)).strftime("%d-%b-%Y")
-    criteria = f'(SINCE "{since_date}" FROM "{sender}")'
+    criteria = f'(SINCE "{since_date}")'
     if debug is not None:
         debug["criteria"] = criteria
+        debug["sender_filter"] = sender
 
     try:
         typ, data = imap.uid("search", None, criteria)
@@ -125,7 +133,7 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
 
     if debug is not None:
         debug["search_typ"] = typ
-        debug["search_raw"] = data
+        debug["search_raw"] = [d.decode(errors="replace") if isinstance(d, bytes) else str(d) for d in data]
 
     if typ != "OK" or not data or not data[0]:
         if debug is not None:
@@ -138,9 +146,11 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
         debug["dropped_no_date_header"] = 0
         debug["dropped_date_parse_error"] = 0
         debug["dropped_older_than_cutoff"] = 0
+        debug["dropped_sender_mismatch"] = 0
         debug["fetch_errors"] = []
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
+    sender_needle = sender.strip().lower()
     matches = []
     for uid in uids:
         try:
@@ -153,6 +163,13 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
                 continue
             raw_header = hdr_data[0][1]
             msg = email.message_from_bytes(raw_header)
+
+            from_ = msg.get("From", "")
+            if sender_needle not in from_.lower():
+                if debug is not None:
+                    debug["dropped_sender_mismatch"] += 1
+                continue
+
             date_hdr = msg.get("Date")
             if not date_hdr:
                 if debug is not None:
@@ -172,7 +189,6 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
                     debug["dropped_older_than_cutoff"] += 1
                 continue
             subject = msg.get("Subject", "(no subject)")
-            from_ = msg.get("From", "")
             matches.append({"uid": uid, "subject": subject, "from": from_, "date": dt})
         except Exception as e:
             if debug is not None:
