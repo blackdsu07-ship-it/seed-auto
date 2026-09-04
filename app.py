@@ -150,10 +150,12 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
         debug["dropped_sender_mismatch"] = 0
         debug["fetch_errors"] = []
         debug["fetch_batches"] = 0
+        debug["sample_from_headers"] = []  # actual From values seen, for eyeballing the real domain
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
     sender_needle = sender.strip().lower()
     matches = []
+    SAMPLE_CAP = 15
 
     # Batch header fetches instead of one IMAP round-trip per message -
     # a mailbox with real volume in the SINCE window made the old
@@ -189,6 +191,9 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
                 msg = email.message_from_bytes(raw_header)
 
                 from_ = msg.get("From", "")
+                if debug is not None and len(debug["sample_from_headers"]) < SAMPLE_CAP:
+                    if from_ not in debug["sample_from_headers"]:
+                        debug["sample_from_headers"].append(from_)
                 if sender_needle not in from_.lower():
                     if debug is not None:
                         debug["dropped_sender_mismatch"] += 1
