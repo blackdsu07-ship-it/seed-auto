@@ -19,6 +19,7 @@ import email.utils
 import imaplib
 import re
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -27,6 +28,8 @@ import streamlit as st
 IMAP_HOST = "imap.mail.yahoo.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT = 20  # seconds - without this a stuck connection hangs forever
+MAX_CANDIDATES_PER_FOLDER = 400  # cap header fetches on high-volume shared seed mailboxes
+FOLDER_TIME_BUDGET = 60  # seconds - abort a folder's header-fetch loop past this, don't hang the whole run
 SPAM_FOLDER_CANDIDATES = ["Bulk", "Bulk Mail", "Spam", "Junk"]
 LOOKBACK_SECONDS = 24 * 60 * 60
 USER_AGENT = (
@@ -119,7 +122,7 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
     by SINCE (which it handles fine), pull headers for that candidate set,
     and match the sender ourselves in Python.
     """
-    since_date = (datetime.now() - timedelta(days=2)).strftime("%d-%b-%Y")
+    since_date = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
     criteria = f'(SINCE "{since_date}")'
     if debug is not None:
         debug["criteria"] = criteria
@@ -142,8 +145,20 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
         return []
 
     uids = data[0].split()
+    uid_strs = [u.decode() if isinstance(u, bytes) else str(u) for u in uids]
+
+    truncated = False
+    if len(uid_strs) > MAX_CANDIDATES_PER_FOLDER:
+        # UIDs increase over time, so keep the newest ones rather than the
+        # oldest - on a shared/high-traffic seed mailbox this can otherwise
+        # mean fetching thousands of unrelated headers one folder at a time.
+        uid_strs = uid_strs[-MAX_CANDIDATES_PER_FOLDER:]
+        truncated = True
+
     if debug is not None:
         debug["raw_uid_count"] = len(uids)
+        debug["candidates_fetched"] = len(uid_strs)
+        debug["candidates_truncated"] = truncated
         debug["dropped_no_date_header"] = 0
         debug["dropped_date_parse_error"] = 0
         debug["dropped_older_than_cutoff"] = 0
@@ -151,6 +166,7 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
         debug["fetch_errors"] = []
         debug["fetch_batches"] = 0
         debug["sample_from_headers"] = []  # actual From values seen, for eyeballing the real domain
+        debug["aborted_time_budget"] = False
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
     sender_needle = sender.strip().lower()
@@ -161,9 +177,13 @@ def search_recent_from(imap, sender, lookback_seconds, debug=None):
     # a mailbox with real volume in the SINCE window made the old
     # one-uid-at-a-time loop slow enough to look like a hang.
     BATCH_SIZE = 200
-    uid_strs = [u.decode() if isinstance(u, bytes) else str(u) for u in uids]
+    start_time = time.monotonic()
 
     for i in range(0, len(uid_strs), BATCH_SIZE):
+        if time.monotonic() - start_time > FOLDER_TIME_BUDGET:
+            if debug is not None:
+                debug["aborted_time_budget"] = True
+            break
         batch = uid_strs[i:i + BATCH_SIZE]
         uid_set = ",".join(batch)
         if debug is not None:
